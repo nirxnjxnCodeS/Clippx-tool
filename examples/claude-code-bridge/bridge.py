@@ -162,3 +162,73 @@ def completion(body: dict, default_model: str) -> dict:
     }
 
 
+def make_handler(default_model: str):
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, status: int, payload: dict):
+            raw = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _authorized(self) -> bool:
+            if not TOKEN:
+                return True
+            return self.headers.get("Authorization", "") == f"Bearer {TOKEN}"
+
+        def do_GET(self):
+            if self.path.rstrip("/") in ("/v1/models", "/models"):
+                return self._send(200, {"object": "list", "data": [
+                    {"id": m, "object": "model", "owned_by": "anthropic"}
+                    for m in ("sonnet", "opus", "haiku")]})
+            if self.path.rstrip("/") in ("", "/health"):
+                return self._send(200, {"ok": True})
+            self._send(404, {"error": {"message": "not found"}})
+
+        def do_POST(self):
+            if self.path.rstrip("/") not in ("/v1/chat/completions", "/chat/completions"):
+                return self._send(404, {"error": {"message": "not found"}})
+            if not self._authorized():
+                return self._send(401, {"error": {"message": "bad token"}})
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._send(400, {"error": {"message": "invalid JSON body"}})
+            if body.get("stream"):
+                return self._send(400, {"error": {"message": "stream not supported"}})
+            started = time.time()
+            try:
+                result = completion(body, default_model)
+            except BridgeError as e:
+                print(f"[bridge] {e.status} {e.message}", flush=True)
+                return self._send(e.status, {"error": {"message": e.message}})
+            u = result["usage"]
+            print(f"[bridge] 200 {result['model']} in={u['prompt_tokens']} "
+                  f"out={u['completion_tokens']} {time.time() - started:.1f}s", flush=True)
+            self._send(200, result)
+
+        def log_message(self, *_):  # quiet default access log
+            pass
+
+    return Handler
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="claude model alias used when the request names none (sonnet|opus|haiku)")
+    args = ap.parse_args()
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(args.model))
+    print(f"[bridge] listening on http://{args.host}:{args.port}/v1  (claude: {CLAUDE_BIN})", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
