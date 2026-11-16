@@ -70,3 +70,95 @@ def build_prompt(body: dict) -> tuple[str, str]:
     return "\n\n".join(p for p in system_parts if p), "\n\n".join(user_parts)
 
 
+def strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else ""
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
+
+
+# Lean mode replaces Claude Code's own (large) system prompt and drops its tools,
+# so a call costs roughly the transcript instead of ~30k tokens of agent setup.
+# Turned off automatically if this CLI version rejects the flags.
+_LEAN = {"on": os.environ.get("BRIDGE_LEAN", "1") != "0"}
+
+
+def _cmd(system: str, model: str, lean: bool) -> list:
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "json", "--model", model, "--max-turns", "1"]
+    if lean:
+        # --strict-mcp-config (with no --mcp-config) loads no MCP servers and
+        # --disable-slash-commands loads no skills: together with --tools ""
+        # this took a test call from ~63k input tokens to ~1k.
+        cmd += ["--system-prompt", system or "You are a helpful assistant.", "--tools", "",
+                "--strict-mcp-config", "--disable-slash-commands"]
+    elif system:
+        cmd += ["--append-system-prompt", system]
+    return cmd
+
+
+def _exec(cmd: list, user: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, input=user, capture_output=True, text=True,
+                              timeout=TIMEOUT, cwd=WORKDIR)
+    except subprocess.TimeoutExpired:
+        raise BridgeError(504, f"claude did not answer within {TIMEOUT:.0f}s")
+    except FileNotFoundError:
+        raise BridgeError(500, f"claude CLI not found ({CLAUDE_BIN}); install Claude Code and log in")
+
+
+def run_claude(system: str, user: str, model: str) -> dict:
+    if not SLOTS.acquire(timeout=TIMEOUT):
+        raise BridgeError(503, "bridge busy")
+    try:
+        proc = _exec(_cmd(system, model, _LEAN["on"]), user)
+        err = (proc.stderr or "").lower()
+        if _LEAN["on"] and proc.returncode != 0 and not (proc.stdout or "").strip() \
+                and ("unknown option" in err or "unknown argument" in err or "error: option" in err):
+            print("[bridge] this claude version lacks --system-prompt/--tools; using full mode",
+                  flush=True)
+            _LEAN["on"] = False
+            proc = _exec(_cmd(system, model, False), user)
+    finally:
+        SLOTS.release()
+    out = (proc.stdout or "").strip()
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        raise BridgeError(502, f"claude exit {proc.returncode}: {(proc.stderr or out)[:400]}")
+    u = data.get("usage") or {}
+    print(f"[bridge] lean={_LEAN['on']} input={u.get('input_tokens')} "
+          f"cache_read={u.get('cache_read_input_tokens')} "
+          f"cache_write={u.get('cache_creation_input_tokens')}", flush=True)
+    if data.get("is_error") or proc.returncode != 0:
+        # Usage limit, auth expired, etc. 429 lets the caller's retry logic back off.
+        msg = str(data.get("result") or proc.stderr or "claude error")[:400]
+        status = 429 if "limit" in msg.lower() else 502
+        raise BridgeError(status, msg)
+    return data
+
+
+def completion(body: dict, default_model: str) -> dict:
+    model = (body.get("model") or default_model).strip() or default_model
+    system, user = build_prompt(body)
+    if not user:
+        raise BridgeError(400, "no user message")
+    data = run_claude(system, user, model)
+    text = strip_fences(str(data.get("result") or ""))
+    usage = data.get("usage") or {}
+    prompt_tokens = int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0) \
+        + int(usage.get("cache_creation_input_tokens") or 0)
+    completion_tokens = int(usage.get("output_tokens") or 0)
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": text}}],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                  "total_tokens": prompt_tokens + completion_tokens},
+    }
+
+
