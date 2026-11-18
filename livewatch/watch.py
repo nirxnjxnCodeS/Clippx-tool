@@ -116,3 +116,109 @@ def wait_until_live(channel, poll=60):
     print(f"[auto] {channel} is live", flush=True)
 
 
+def watch(args):
+    work = os.path.join(HERE, "work", args.channel)
+    seg_dir = os.path.join(work, "segments")
+    shutil.rmtree(seg_dir, ignore_errors=True)       # old rolling recording only
+    os.makedirs(seg_dir, exist_ok=True)
+    import glob as _glob
+    leftovers = sorted(_glob.glob(os.path.join(work, "raw_*.mp4")))  # cut but not edited last run
+
+    rec = recorder.Recorder(args.channel, seg_dir, buffer_seconds=args.before + args.after + 240,
+                            use_streamlink=not args.no_adblock)
+    reader = chatmod.ChatReader(args.channel)
+    det = chatmod.Detector(threshold=args.threshold, cooldown=args.cooldown, min_msgs=args.min_msgs)
+    jobs = queue.Queue()
+    counters = {"made": 0, "detected": 0, "pending": 0}
+    for raw in leftovers:
+        try:
+            when = time.strftime("%H:%M:%S", time.localtime(int(os.path.basename(raw)[4:-4])))
+        except ValueError:
+            when = ""
+        counters["pending"] += 1
+        jobs.put((raw, 0, when))
+    if leftovers:
+        print(f"[watch] editing {len(leftovers)} clip(s) left over from the last run first", flush=True)
+    threading.Thread(target=editor_worker, args=(jobs, args, counters), daemon=True).start()
+    rec.start()
+    reader.start()
+
+    started = time.time()
+    last_status = 0.0
+    clip_times = []
+    base_threshold = args.threshold
+    last_adjust = started
+    print(f"[watch] {args.channel}: threshold {args.threshold}, clip = {args.before}s before + "
+          f"{args.after}s after, max {args.max_clips} clips, {args.hours}h. Ctrl+C to stop.",
+          flush=True)
+    try:
+        while True:
+            now = time.time()
+            if now - started > args.hours * 3600:
+                print("[watch] monitoring time limit reached", flush=True)
+                break
+            if counters["detected"] >= args.max_clips:
+                print("[watch] clip limit reached", flush=True)
+                break
+            if rec.offline_since and now - rec.offline_since > 180:
+                print("[watch] stream looks offline for 3 min", flush=True)
+                break
+            # keep the rate between --min-per-hour and --per-hour: if no clip for a while, lower the
+            # bar 5 points every 6 min (floor 45); after each clip, go back to the chosen threshold.
+            if args.min_per_hour and now - last_adjust >= 360 and s_ready(reader, now):
+                gap = 3600 / args.min_per_hour
+                last_clip = clip_times[-1] if clip_times else started
+                if now - last_clip > gap and det.threshold > 45:
+                    det.threshold = max(45, det.threshold - 5)
+                    print(f"[watch] quiet stretch: sensitivity bar lowered to {det.threshold}", flush=True)
+                last_adjust = now
+            s = chatmod.score_at(reader.snapshot(), now, reader.started_at)
+            event = det.update(now, s)
+            if event and args.per_hour:
+                recent = [t for t in clip_times if now - t < 3600]
+                if len(recent) >= args.per_hour:
+                    wait_min = int((3600 - (now - recent[0])) / 60) + 1
+                    print(f"[clip] spike (score {event[1]}) skipped: {args.per_hour}/hour reached, "
+                          f"next slot in ~{wait_min} min", flush=True)
+                    event = None
+            if event:
+                spike_start, peak = event
+                clip_times.append(now)
+                det.threshold = base_threshold
+                counters["detected"] += 1
+                counters["pending"] += 1
+                t0, t1 = spike_start - args.before, spike_start + args.after
+                print(f"\n[clip] 🔥 highlight #{counters['detected']}: score {peak} "
+                      f"({s['rate']:.1f} msg/s vs normal {s['normal']:.1f}); cutting...", flush=True)
+                threading.Thread(target=cutter, args=(seg_dir, t0, t1, peak, jobs, work, counters),
+                                 daemon=True).start()
+            if now - last_status >= 5:
+                last_status = now
+                state = "warming up" if not s["ready"] else f"score {s['score']:>3}/{det.threshold}"
+                rec_state = ("rec ● ads✂" if rec.ads_filtered else "rec ● ADS ON") if rec.recording() else "rec …"
+                chat_state = "chat ●" if reader.connected else "chat …"
+                print(f"[meter] {rec_state} {chat_state} | {s['rate']:.1f} msg/s · normal "
+                      f"{s['normal']:.1f} · {state} · clips {counters['made']}/{counters['detected']}",
+                      flush=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[watch] stopping...", flush=True)
+    finally:
+        # keep recording until the last highlight's "after" seconds are in, then stop
+        deadline = time.time() + args.after + 2 * recorder.SEGMENT + 5
+        while counters["pending"] > 0 and time.time() < deadline:
+            time.sleep(1)
+        rec.stop()
+        reader.stop()
+        if counters["pending"] > 0:
+            print(f"[watch] finishing {counters['pending']} clip(s) still being edited...", flush=True)
+        give_up = time.time() + 900
+        while counters["pending"] > 0 and time.time() < give_up:
+            time.sleep(2)
+        jobs.put(None)
+        time.sleep(1)
+        shutil.rmtree(seg_dir, ignore_errors=True)   # the rolling recording; clips + recorder.log stay
+        print(f"[watch] done: {counters['made']} clips in livewatch/clips/{args.channel}/ — open "
+              "livewatch/clips/index.html", flush=True)
+
+
