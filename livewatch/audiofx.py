@@ -80,3 +80,63 @@ def pick_music(mood):
     return random.choice(lib.get(mood) or lib.get("hype") or next(iter(lib.values())))
 
 
+# ---------------------------------------------------------------- AI plan
+def plan_prompt(channel, words, sfx_labels, sfx_max):
+    timed = " ".join(f"[{i}]{w['word']}" for i, w in enumerate(words))[:6000]
+    return (
+        f"Clip of the Twitch streamer {channel}. Transcript, each word numbered [n]:\n{timed}\n\n"
+        f"Plan the sound design. Available sound effects: {', '.join(sfx_labels)}.\n"
+        f"Return JSON with:\n"
+        f'- "mood": one of {", ".join(MOODS)} (overall feel of the clip)\n'
+        f'- "sfx": up to {sfx_max} items {{"word": n, "sound": name, "punch": true/false}}. Place an effect '
+        "right AFTER the word it reacts to (a punchline, a fail, a big play, a shocked reaction). Only where "
+        "it really adds something; fewer is better than random. Never in the first word. "
+        '"punch" = also do a quick zoom (use only for the biggest moment).\n'
+        "Reply with only the JSON object."
+    )
+
+
+def clean_plan(raw, words, sfx_lib, sfx_max):
+    mood = raw.get("mood") if raw.get("mood") in MOODS else "hype"
+    items, used_times = [], []
+    for it in raw.get("sfx") or []:
+        try:
+            idx, sound = int(it.get("word")), str(it.get("sound", "")).strip().lower()
+        except (TypeError, ValueError):
+            continue
+        if sound not in sfx_lib or not (1 <= idx < len(words)):
+            continue
+        t = float(words[idx]["end"])
+        if t < 1.0 or any(abs(t - u) < 1.5 for u in used_times):   # spread effects out
+            continue
+        used_times.append(t)
+        items.append({"time": round(t, 2), "sound": sound, "punch": bool(it.get("punch"))})
+        if len(items) >= sfx_max:
+            break
+    return {"mood": mood, "sfx": items, "typewriter": bool(raw.get("typewriter"))}
+
+
+def ai_plan(channel, words, sfx_max):
+    """Ask Claude via the bridge for mood + sfx placements. Falls back to mood 'hype', no sfx."""
+    sys.path.insert(0, HERE)
+    import pipeline  # for .env loading
+    pipeline._load_env()
+    lib = sfx_library()
+    base = os.environ.get("LLM_BASE_URL", "").rstrip("/")
+    if not base or not words or sfx_max <= 0:
+        return {"mood": "hype", "sfx": []}
+    try:
+        import httpx
+        r = httpx.post(f"{base}/chat/completions", timeout=180, json={
+            "model": os.environ.get("LLM_MODEL", "sonnet"),
+            "messages": [{"role": "user", "content": plan_prompt(channel, words, sorted(lib), sfx_max)}],
+            "response_format": {"type": "json_object"}})
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"]
+        raw = json.loads(text[text.find("{"): text.rfind("}") + 1])
+        return clean_plan(raw, words, lib, sfx_max)
+    except Exception as e:
+        print(f"[audio] AI sound plan skipped ({type(e).__name__}: {e})", flush=True)
+        return {"mood": "hype", "sfx": []}
+
+
