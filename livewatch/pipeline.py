@@ -114,3 +114,84 @@ def reframe(raw, out, facecam=None):
     return "centre", None
 
 
+# ---------------------------------------------------------------- AI hook
+def _load_env():
+    path = os.path.join(APP, ".env")
+    if not os.path.exists(path):
+        return
+    for line in open(path):
+        m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$", line)
+        if m and m.group(1) not in os.environ:
+            os.environ[m.group(1)] = m.group(2)
+
+
+def ensure_tags(caption, channel, tags):
+    """Campaign rules (e.g. Lacy): the caption must name the streamer and carry the hashtags."""
+    caption = caption.strip()
+    if channel.lower() not in caption.lower():
+        caption = f"{channel.upper()} {caption}"
+    for tag in tags.split():
+        if tag.lower() not in caption.lower():
+            caption += f" {tag}"
+    return caption
+
+
+def ai_hook(channel, words, sfx_max=0, tags=None):
+    """ONE Claude call (via the bridge) for the whole edit:
+    {'hook': [line1, line2], 'caption': str, 'plan': {'mood', 'sfx'}}; plain fallback on failure."""
+    import audiofx
+    tags = tags or f"#{channel} #twitch"
+    fallback = {"hook": [], "caption": ensure_tags(f"{channel.upper()} moment 😭", channel, tags),
+                "plan": {"mood": "hype", "sfx": []}}
+    _load_env()
+    base = os.environ.get("LLM_BASE_URL", "").rstrip("/")
+    if not base or not words:
+        return fallback
+    lib = audiofx.sfx_library()
+    numbered = " ".join(f"[{i}]{w['word']}" for i, w in enumerate(words))[:6000]
+    sound_part = ""
+    if sfx_max > 0 and lib:
+        sound_part = (
+            f'- "mood": one of {", ".join(audiofx.MOODS)} (overall feel, picks the background music).\n'
+            f'- "sfx": up to {sfx_max} items {{"word": n, "sound": name, "punch": true/false}} from these '
+            f"sound effects: {', '.join(sorted(lib))}. Place each right AFTER the word it reacts to "
+            "(punchline, fail, big play, shocked reaction); only where it adds something, fewer is better, "
+            'never on word 0. "punch" = cut to the streamer\'s face for the single biggest reaction.\n'
+            '- "typewriter": true if the hook reads like a story setup or suspense (it will type itself '
+            "out letter by letter with a typing sound at the start), false for instant hype/shock hooks.\n")
+    notes_path = os.path.join(HERE, "notes", f"{channel.lower()}.txt")
+    notes = open(notes_path).read().strip() if os.path.exists(notes_path) else ""
+    prompt = (
+        (f"Facts you must respect (pronouns, names):\n{notes}\n\n" if notes else "") +
+        f"Transcript of a ~40 second Twitch clip of the streamer {channel}, each word numbered [n]:\n"
+        f"{numbered}\n\n"
+        "Write JSON with:\n"
+        '- "hook1" and "hook2": an on-screen hook in two short lines, UPPERCASE, max 24 '
+        "characters each, no emojis, no hashtags. It must describe what actually happens in the "
+        f"clip (no made-up events, nothing negative about {channel}) and should mention {channel.upper()} "
+        "when it fits.\n"
+        f'- "caption": one short social caption that names {channel.upper()}, with 1-2 emojis, '
+        f"ending with {tags}. English only.\n"
+        f"{sound_part}"
+        "Reply with only the JSON object."
+    )
+    try:
+        import httpx
+        r = httpx.post(f"{base}/chat/completions", timeout=180, json={
+            "model": os.environ.get("LLM_MODEL", "sonnet"),
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}})
+        r.raise_for_status()
+        text = r.json()["choices"][0]["message"]["content"]
+        data = json.loads(text[text.find("{"): text.rfind("}") + 1])
+        hook = [str(data.get(k, "")).upper()[:28] for k in ("hook1", "hook2") if data.get(k)]
+        plan = audiofx.clean_plan(data, words, lib, sfx_max) if sfx_max > 0 else fallback["plan"]
+        caption = ensure_tags(str(data.get("caption") or fallback["caption"]), channel, tags)
+        return {"hook": hook, "caption": caption, "plan": plan}
+    except Exception as e:
+        hint = (" Start the Claude bridge on the Mac: python3 examples/claude-code-bridge/bridge.py"
+                if "refused" in str(e).lower() or "ConnectError" in type(e).__name__ else "")
+        print(f"[edit] AI hook skipped ({type(e).__name__}: {e}).{hint}", flush=True)
+        return fallback
+
+
