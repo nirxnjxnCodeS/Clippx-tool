@@ -124,3 +124,47 @@ class Recorder(threading.Thread):
                 p.terminate()
 
 
+def segments_between(seg_dir, t0, t1):
+    """(epoch, path) of the segments that overlap [t0, t1], oldest first."""
+    out = []
+    for path in glob.glob(os.path.join(seg_dir, "*.ts")):
+        try:
+            start = int(os.path.basename(path)[:-3])
+        except ValueError:
+            continue
+        if start + SEGMENT + 1 >= t0 and start <= t1:
+            out.append((start, path))
+    return sorted(out)
+
+
+def cut(seg_dir, t0, t1, out_path, max_height=1080, fps=30):
+    """Cut wall-clock [t0, t1] out of the rolling buffer into an mp4. Returns True on success."""
+    segs = segments_between(seg_dir, t0, t1)
+    if not segs:
+        return False
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    listing = out_path + ".txt"
+    with open(listing, "w") as f:
+        for _, p in segs:
+            f.write(f"file '{p}'\n")
+    offset = max(0.0, t0 - segs[0][0])
+    try:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", listing,
+             "-ss", f"{offset:.2f}", "-t", f"{t1 - t0:.2f}",
+             "-vf", f"scale=-2:'min({max_height},ih)',fps={fps}",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+             "-c:a", "aac", "-b:a", "160k", "-ar", "48000", out_path],
+            check=True, timeout=300)
+    finally:
+        os.remove(listing)
+    if not os.path.exists(out_path):
+        return False
+    try:
+        got = float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                             "-of", "csv=p=0", out_path]).decode().strip())
+        if got < 0.7 * (t1 - t0):
+            print(f"[clip] warning: only {got:.0f}s of {t1 - t0:.0f}s was recorded for this moment", flush=True)
+    except (subprocess.CalledProcessError, ValueError):
+        pass
+    return True
