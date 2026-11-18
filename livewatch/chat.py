@@ -96,3 +96,45 @@ class ChatReader(threading.Thread):
         self.stop_event.set()
 
 
+def score_at(messages, now, started_at, window=WINDOW, baseline=BASELINE):
+    """Return a dict describing the chat at time `now` (score 0-100, rates, readiness)."""
+    times = [m[0] for m in messages]          # appended in arrival order, so sorted
+
+    def count(a, b):                          # messages with a < ts <= b, in O(log n)
+        return bisect.bisect_right(times, b) - bisect.bisect_right(times, a)
+
+    lo = bisect.bisect_right(times, now - window)
+    recent = messages[lo:bisect.bisect_right(times, now)]
+    rate_now = len(recent) / window
+    ready = started_at is not None and now - started_at >= WARMUP
+    # Normal pace: median of the window-sized rates over the baseline period,
+    # excluding the current window so a spike does not raise its own bar.
+    hist_start = max(now - baseline, started_at or now)
+    rates = []
+    t = now - window
+    while t - window >= hist_start:
+        rates.append(count(t - window, t) / window)
+        t -= window / 2
+    normal = statistics.median(rates) if rates else 0.0
+    # After a chat outage (disconnect, stuck connection) the history is mostly empty and any
+    # chat at all looks like a giant spike. Only trust the baseline when most of the history
+    # windows actually had messages in them.
+    filled = sum(1 for r in rates if r > 0) / len(rates) if rates else 0.0
+    ratio = rate_now / max(normal, FLOOR_RATE)
+    texts = [m[2].strip().lower() for m in recent]
+    repetition = (1 - len(set(texts)) / len(texts)) if texts else 0.0
+    score = 0.0
+    if ratio > 1:
+        score = 60 * math.log2(ratio)
+    score += 15 * repetition
+    score = max(0.0, min(100.0, score))
+    return {
+        "score": round(score),
+        "rate": rate_now,
+        "normal": normal,
+        "msgs": len(recent),
+        "repetition": repetition,
+        "ready": ready and len(rates) >= 3 and filled >= 0.7,
+    }
+
+
