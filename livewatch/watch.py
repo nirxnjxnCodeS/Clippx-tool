@@ -222,3 +222,79 @@ def watch(args):
               "livewatch/clips/index.html", flush=True)
 
 
+def test_file(args):
+    """Edit one stretch of a local video as if it were a highlight (no Twitch needed)."""
+    import subprocess
+    work = os.path.join(HERE, "work", "test")
+    os.makedirs(work, exist_ok=True)
+    raw = os.path.join(work, "raw_test.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(args.test_start), "-t",
+                    str(args.before + args.after), "-i", args.test_file, "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "18", "-c:a", "aac", raw], check=True)
+    pipeline.make_clip(raw, args.channel, 99, CLIPS, hook_ai=not args.no_hook, sfx_max=args.sfx_max,
+                       music=not args.no_music, music_db=args.music_db, shake=not args.no_shake,
+                       tags=args.tags, facecam=args.facecam)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Self-hosted live Twitch clipper.")
+    p.add_argument("channel", nargs="?", help="Twitch channel name, e.g. lacy")
+    p.add_argument("--threshold", type=int, default=60,
+                   help="clip sensitivity 40-90 (lower = more clips). Default 60 = about 2x normal chat")
+    p.add_argument("--before", type=int, default=30, help="seconds kept before the chat spike")
+    p.add_argument("--after", type=int, default=10, help="seconds kept after the chat spike")
+    p.add_argument("--cooldown", type=int, default=45, help="minimum seconds between clips")
+    p.add_argument("--min-msgs", type=int, default=chatmod.MIN_MSGS,
+                   help="messages needed in 10 s for a spike (lower it for small/quiet chats)")
+    p.add_argument("--max-clips", type=int, default=40, help="stop after this many clips")
+    p.add_argument("--per-hour", type=int, default=30, help="at most this many clips per hour (0 = no cap)")
+    p.add_argument("--min-per-hour", type=int, default=5,
+                   help="aim for at least this many per hour: lowers the bar in quiet stretches (0 = off)")
+    p.add_argument("--hours", type=float, default=8, help="stop after this many hours")
+    p.add_argument("--auto", action="store_true", help="wait for the channel to go live, and "
+                                                        "start again after it goes offline")
+    p.add_argument("--no-hook", action="store_true", help="skip the Claude hook/caption/sound plan")
+    p.add_argument("--sfx-max", type=int, default=2,
+                   help="max sound effects per clip (0 = none, 2 = subtle, 4 = heavy)")
+    p.add_argument("--no-music", action="store_true", help="no background music")
+    p.add_argument("--no-shake", action="store_true", help="no camera shake on loud moments")
+    p.add_argument("--facecam", default=None,
+                   help="streamer's webcam box in a 1920x1080 frame as x,y,w,h (e.g. Lacy: 60,0,400,278); "
+                        "puts the face on top of every clip and skips slow auto-detection")
+    p.add_argument("--no-adblock", action="store_true",
+                   help="record directly (no streamlink ad skipping); use if recording keeps failing")
+    p.add_argument("--tags", default=None,
+                   help='hashtags every caption must carry, e.g. "#LACY #GTA6" (default "#<channel> #twitch")')
+    p.add_argument("--music-db", type=float, default=-20.0,
+                   help="background music level in dB (-24 quieter, -16 louder)")
+    p.add_argument("--test-file", help="edit a local video instead of watching Twitch")
+    p.add_argument("--test-start", type=float, default=0)
+    p.add_argument("--test-channel", default="test")
+    args = p.parse_args()
+    if args.facecam:
+        try:
+            args.facecam = tuple(int(v) for v in args.facecam.split(","))
+            assert len(args.facecam) == 4 and args.facecam[2] > 0 and args.facecam[3] > 0
+        except (ValueError, AssertionError):
+            p.error("--facecam must be x,y,w,h, e.g. 60,0,400,278")
+
+    if args.test_file:
+        args.channel = args.test_channel
+        return test_file(args)
+    if not args.channel or not recorder.valid_channel(args.channel):
+        p.error("give a Twitch channel name (letters, numbers, underscore)")
+    args.channel = args.channel.lower()
+    args.threshold = max(40, min(90, args.threshold))
+    while True:
+        if args.auto:
+            wait_until_live(args.channel)
+        elif not recorder.stream_url(args.channel):
+            print(f"{args.channel} is offline. Use --auto to wait for them to go live.")
+            return
+        watch(args)
+        if not args.auto:
+            return
+
+
+if __name__ == "__main__":
+    main()
