@@ -83,3 +83,36 @@ def drop_ads(raw, min_len=15):
     return True
 
 
+def cutter(seg_dir, t0, t1, score, jobs, work_dir, counters):
+    # wait until the "after" part has been recorded (plus one segment of slack)
+    time.sleep(max(0.0, t1 - time.time()) + recorder.SEGMENT + 2)
+    raw = os.path.join(work_dir, f"raw_{int(t0)}.mp4")
+    try:
+        ok = recorder.cut(seg_dir, t0, t1, raw)
+    except Exception as e:
+        print(f"[clip] cut failed: {e}", flush=True)
+        ok = False
+    if ok:
+        ok = drop_ads(raw)
+    if not ok:
+        print("[clip] skipped (nothing recorded, or Twitch commercial break)", flush=True)
+    elif jobs.qsize() >= 8:
+        print("[clip] editor is behind; skipping this one", flush=True)
+        os.remove(raw)
+    else:
+        jobs.put((raw, score, time.strftime("%H:%M:%S", time.localtime(t0))))
+        return                      # the editor decrements "pending" when it is done
+    counters["pending"] -= 1
+
+
+def s_ready(reader, now):
+    return reader.started_at is not None and now - reader.started_at >= chatmod.WARMUP
+
+
+def wait_until_live(channel, poll=60):
+    print(f"[auto] waiting for {channel} to go live (checking every {poll}s)...", flush=True)
+    while not recorder.stream_url(channel):
+        time.sleep(poll)
+    print(f"[auto] {channel} is live", flush=True)
+
+
