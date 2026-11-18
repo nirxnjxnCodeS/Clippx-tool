@@ -363,3 +363,69 @@ def style(vertical, out, words, hook, seam=None, typewriter=False):
                        check=True)
 
 
+# ---------------------------------------------------------------- delivery
+def telegram(path, caption):
+    _load_env()
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        return
+    try:
+        import httpx
+        send = path
+        tmpdir = None
+        if os.path.getsize(path) > 45 * 1024 * 1024:     # bots may upload at most 50 MB
+            tmpdir = tempfile.mkdtemp()
+            send = os.path.join(tmpdir, os.path.basename(path))
+            # still 1080x1920 (you may post from the phone), just a lower bitrate: ~6 Mbps
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path,
+                            "-c:v", "libx264", "-preset", "veryfast", "-b:v", "5500k",
+                            "-maxrate", "6500k", "-bufsize", "11000k",
+                            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", send], check=True)
+        with open(send, "rb") as f:
+            r = httpx.post(f"https://api.telegram.org/bot{token}/sendVideo", timeout=300,
+                           data={"chat_id": chat, "caption": caption[:1000], "supports_streaming": "true"},
+                           files={"video": (os.path.basename(send), f, "video/mp4")})
+        if tmpdir:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        r.raise_for_status()
+        print("[deliver] sent to Telegram" + (" (1080p phone copy, original in gallery)" if tmpdir else ""),
+              flush=True)
+    except Exception as e:
+        detail = getattr(getattr(e, "response", None), "text", "")[:200]
+        print(f"[deliver] Telegram failed ({type(e).__name__}: {e}) {detail}", flush=True)
+
+
+def gallery(clips_root):
+    """Rebuild clips/index.html: newest first, video + hook + caption with a copy button."""
+    items = []
+    for meta_path in sorted(_glob(clips_root, "*/*.json"), reverse=True):
+        try:
+            meta = json.load(open(meta_path))
+        except (OSError, ValueError):
+            continue
+        rel = os.path.relpath(meta_path[:-5] + ".mp4", clips_root)
+        cap = html.escape(meta.get("caption", ""))
+        items.append(
+            f'<div class="c"><video src="{html.escape(rel)}" controls preload="metadata"></video>'
+            f'<b>{html.escape(meta.get("channel", ""))}</b> · score {meta.get("score")} · '
+            f'{html.escape(meta.get("time", ""))} · {html.escape(meta.get("layout", ""))}'
+            f'<p class="h">{html.escape(" / ".join(meta.get("hook", [])))}</p>'
+            f'<p>{cap}</p><button onclick="navigator.clipboard.writeText(this.dataset.t)" '
+            f'data-t="{cap}">Copy caption</button></div>')
+    page = ("<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=60>"
+            "<title>livewatch clips</title><style>body{font:14px system-ui;background:#111;color:#eee;"
+            "margin:16px}.g{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));"
+            "gap:16px}.c{background:#1c1c1e;border-radius:12px;padding:10px}video{width:100%;"
+            "aspect-ratio:9/16;background:#000;border-radius:8px}.h{color:#ffe14d;font-weight:700}"
+            "button{padding:6px 10px;border-radius:8px;border:0;cursor:pointer}</style>"
+            f"<h2>livewatch clips ({len(items)})</h2><div class=g>{''.join(items)}</div>")
+    with open(os.path.join(clips_root, "index.html"), "w") as f:
+        f.write(page)
+
+
+def _glob(root, pattern):
+    import glob
+    return glob.glob(os.path.join(root, pattern))
+
+
