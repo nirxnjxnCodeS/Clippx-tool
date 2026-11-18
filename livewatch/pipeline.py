@@ -429,3 +429,51 @@ def _glob(root, pattern):
     return glob.glob(os.path.join(root, pattern))
 
 
+def make_clip(raw, channel, score, clips_root, stream_time="", hook_ai=True,
+              sfx_max=2, music=True, music_db=None, shake=True, tags=None, facecam=None):
+    """Full edit of one raw cut. Returns the final mp4 path."""
+    import audiofx
+    t0 = time.time()
+    out_dir = os.path.join(clips_root, channel)
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    final = os.path.join(out_dir, f"{stamp}_s{score}.mp4")
+    sound = {"mood": None, "music": None, "sfx": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        vertical = os.path.join(tmp, "v.mp4")
+        words = transcribe(raw)
+        layout, caption_y = reframe(raw, vertical, facecam)
+        info = (ai_hook(channel, words, sfx_max, tags) if hook_ai else
+                {"hook": [], "caption": ensure_tags("", channel, tags or f"#{channel}"),
+                 "plan": {"mood": "hype", "sfx": []}})
+        # sound design + motion go on BEFORE the text, so punches/shakes never move the hook/captions
+        if music or sfx_max > 0 or shake:
+            try:
+                plan = info["plan"]
+                track = audiofx.pick_music(plan["mood"]) if music else None
+                mixed = os.path.join(tmp, "fx.mp4")
+                type_dur = typing_seconds(info["hook"]) if (plan.get("typewriter") and info["hook"]) else None
+                sound = audiofx.apply(vertical, mixed, plan, track,
+                                      music_db if music_db is not None else audiofx.MUSIC_DB,
+                                      cam_h=caption_y,   # facecam band height in facecam layout
+                                      shake=shake, typing_dur=type_dur)
+                vertical = mixed
+            except Exception as e:
+                print(f"[audio] skipped ({type(e).__name__}: {e})", flush=True)
+        os.makedirs(out_dir, exist_ok=True)   # recreate if the clips folder was cleaned mid-run
+        style(vertical, final, words, info["hook"], caption_y,
+              typewriter=bool(info.get("plan", {}).get("typewriter")))
+    meta = {"channel": channel, "score": score, "time": stream_time or time.strftime("%H:%M:%S"),
+            "layout": layout, "cam_h": caption_y, "hook": info["hook"], "caption": info["caption"],
+            "mood": sound.get("mood"), "music": sound.get("music"),
+            "sfx": [f"{s['sound']}@{s['time']}s" for s in sound.get("sfx", [])],
+            "shakes": sound.get("shakes", []),
+            "typewriter": bool(info.get("plan", {}).get("typewriter")),
+            "words": len(words), "seconds_to_edit": round(time.time() - t0, 1)}
+    with open(final[:-4] + ".json", "w") as f:
+        json.dump(meta, f, indent=1)
+    gallery(clips_root)
+    telegram(final, (" / ".join(info["hook"]) + "\n\n" + info["caption"]).strip())
+    print(f"[deliver] {os.path.relpath(final, clips_root)}  ({layout}, "
+          f"{meta['seconds_to_edit']}s to edit)", flush=True)
+    return final
