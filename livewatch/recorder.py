@@ -34,3 +34,93 @@ def stream_url(channel, max_height=1080):
     return url[0] if url else None
 
 
+class Recorder(threading.Thread):
+    def __init__(self, channel, seg_dir, buffer_seconds=300, use_streamlink=True):
+        super().__init__(daemon=True)
+        self.use_streamlink = use_streamlink
+        self.channel = channel
+        self.seg_dir = seg_dir
+        self.buffer = buffer_seconds
+        self.stop_event = threading.Event()
+        self.proc = None
+        self.source = None
+        self.ads_filtered = False
+        self.offline_since = None
+        os.makedirs(seg_dir, exist_ok=True)
+
+    def run(self):
+        log_path = os.path.join(os.path.dirname(self.seg_dir), "recorder.log")
+        quick_fails = 0
+        while not self.stop_event.is_set():
+            url = stream_url(self.channel)
+            if not url:
+                self.offline_since = self.offline_since or time.time()
+                self.stop_event.wait(20)
+                continue
+            self.offline_since = None
+            segment_args = ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "segment",
+                            "-segment_time", str(SEGMENT), "-reset_timestamps", "1", "-strftime", "1",
+                            os.path.join(self.seg_dir, "%s.ts")]
+            self.source = None
+            os.makedirs(self.seg_dir, exist_ok=True)   # recreate if someone cleaned up mid-run
+            log = open(log_path, "a")
+            log.write(f"\n--- {time.strftime('%H:%M:%S')} start ({'streamlink' if self.use_streamlink else 'direct'})\n")
+            log.flush()
+            started = time.time()
+            if self.use_streamlink and shutil.which("streamlink"):
+                # streamlink skips Twitch's inserted ad segments (built in since streamlink 6; the old
+                # --twitch-disable-ads switch no longer exists), so ads never reach the recording.
+                self.source = subprocess.Popen(
+                    ["streamlink", "--loglevel", "warning", "--stdout",
+                     f"https://www.twitch.tv/{self.channel.lower()}", "1080p60,1080p,best"],
+                    stdout=subprocess.PIPE, stderr=log)
+                # -re: streamlink hands over video in bursts; read it at real-time speed so each
+                # 2 s segment is written in its own wall-clock second. Without it several segments
+                # land in the same second and overwrite each other (%s names), losing ~2/3 of the video.
+                # -v fatal: Twitch streams make the H.264 parser print harmless warnings non-stop
+                self.proc = subprocess.Popen(["ffmpeg", "-v", "fatal", "-nostdin", "-re", "-i", "pipe:0",
+                                              *segment_args], stdin=self.source.stdout, stderr=log)
+                self.source.stdout.close()   # ffmpeg owns the pipe now
+                self.ads_filtered = True
+            else:
+                self.proc = subprocess.Popen(["ffmpeg", "-v", "fatal", "-nostdin", "-i", url,
+                                              *segment_args], stderr=log)
+                self.ads_filtered = False
+            while self.proc.poll() is None and not self.stop_event.is_set():
+                self._prune()
+                self.stop_event.wait(5)
+            for p in (self.proc, self.source):
+                if p and p.poll() is None:
+                    p.terminate()
+            log.close()
+            if self.stop_event.is_set():
+                break
+            # Ended by itself: URL expired, stream dropped, or the ad-skipping pipe failed.
+            if time.time() - started < 30:
+                quick_fails += 1
+                if self.use_streamlink and quick_fails >= 3:
+                    self.use_streamlink = False
+                    print("[rec] ad-skipping recorder keeps failing (see livewatch/work/<channel>/recorder.log);"
+                          " switched to the direct recorder (ads may appear)", flush=True)
+            else:
+                quick_fails = 0
+
+    def _prune(self):
+        cutoff = time.time() - self.buffer
+        for path in glob.glob(os.path.join(self.seg_dir, "*.ts")):
+            try:
+                if int(os.path.basename(path)[:-3]) < cutoff:
+                    os.remove(path)
+            except (ValueError, OSError):
+                pass
+
+    def recording(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self):
+        self.stop_event.set()
+        for p in (self.proc, self.source):
+            if p and p.poll() is None:
+                p.terminate()
+
+
