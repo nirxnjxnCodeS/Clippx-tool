@@ -296,3 +296,70 @@ def hook_typewriter_frames(lines, folder):
     return os.path.join(folder, "h_%04d.png")
 
 
+def _ass_time(s):
+    s = max(0.0, s)
+    return f"{int(s // 3600)}:{int(s % 3600 // 60):02d}:{s % 60:05.2f}"
+
+
+def captions_ass(words, path, caption_y=None, per_group=2):
+    """Word-by-word captions: groups of 2, current word yellow, small pop-in."""
+    pos = f"\\an5\\pos({W // 2},{caption_y})" if caption_y else ""
+    head = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {W}
+PlayResY: {H}
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Cap,Montserrat ExtraBold,88,&H00FFFFFF,&H00FFFFFF,&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,8,4,2,60,60,560,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    clean = [dict(w, word=re.sub(r"[{}\\]", "", w["word"]).upper()) for w in words]
+    events = []
+    for g in range(0, len(clean), per_group):
+        group = clean[g:g + per_group]
+        for i, w in enumerate(group):
+            k = g + i
+            end = clean[k + 1]["start"] if k + 1 < len(clean) else w["end"] + 0.2
+            end = min(end, w["end"] + 0.6)         # don't hold a word across a long pause
+            if end - w["start"] < 0.04:
+                continue
+            parts = [("{\\c&H004DE1FF&}" + x["word"] + "{\\c&H00FFFFFF&}") if j == i else x["word"]
+                     for j, x in enumerate(group)]
+            pop = "\\fscx118\\fscy118\\t(0,90,\\fscx100\\fscy100)" if i == 0 else ""
+            tags = "{" + pos + pop + "}" if (pos or pop) else ""
+            events.append(f"Dialogue: 0,{_ass_time(w['start'])},{_ass_time(end)},Cap,,0,0,0,,"
+                          f"{tags}{' '.join(parts)}")
+    with open(path, "w") as f:
+        f.write(head + "\n".join(events) + "\n")
+
+
+def style(vertical, out, words, hook, seam=None, typewriter=False):
+    """Burn captions + hook. `seam` = y of the facecam/gameplay border (facecam layout):
+    the hook sits on the seam so it never covers the streamer's face, captions just below.
+    Without a seam: hook near the top, captions in the lower third.
+    typewriter: the hook types itself out at the start (frames from hook_typewriter_frames)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ass = os.path.join(tmp, "c.ass")
+        captions_ass(words, ass, seam + 300 if seam else None)
+        inputs, graph = ["-i", vertical], f"[0:v]ass={ass}:fontsdir={FONTS}"
+        if hook:
+            if typewriter:
+                pattern = hook_typewriter_frames(hook, tmp)
+                inputs += ["-framerate", str(TYPE_FPS), "-i", pattern]   # last frame holds (overlay repeats it)
+            else:
+                png = os.path.join(tmp, "h.png")
+                hook_png(hook, png)
+                inputs += ["-i", png]
+            hook_y = f"{seam}-h/2" if seam else "250"
+            graph += f"[c];[c][1:v]overlay=(W-w)/2:{hook_y}"
+        graph += ",format=yuv420p[v]"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", graph,
+                        "-map", "[v]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "21", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out],
+                       check=True)
+
+
