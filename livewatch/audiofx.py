@@ -217,3 +217,81 @@ def face_punch_graph(punches, cam_h, w=1080, h=1920):
             f"[base][face]overlay=0:0:enable='{on}'[vp]")
 
 
+def audio_graph(n_sfx, sfx_times, duration, has_music, music_db=MUSIC_DB, sfx_db=SFX_DB,
+                typing_dur=None):
+    """filter_complex for audio. Inputs: 0 = clip, 1 = music (if any), then the effects,
+    then the typing sound (if typing_dur)."""
+    fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+    parts, mix = [], ["[voice]"]
+    parts.append(f"[0:a]{fmt},asplit=2[voice][sc]")
+    nxt = 1
+    if has_music:
+        fade_out = max(0.0, duration - 1.2)
+        parts.append(f"[1:a]{fmt},volume={music_db}dB,afade=t=in:d=0.6,"
+                     f"afade=t=out:st={fade_out:.2f}:d=1.2[mus]")
+        # duck the music whenever the stream audio (speech) is loud
+        parts.append("[mus][sc]sidechaincompress=threshold=0.04:ratio=6:attack=15:release=350[ducked]")
+        mix.append("[ducked]")
+        nxt = 2
+    else:
+        parts.append("[sc]anullsink")
+    for k, t in enumerate(sfx_times):
+        ms = int(t * 1000)
+        parts.append(f"[{nxt + k}:a]{fmt},volume={sfx_db}dB,adelay={ms}|{ms}[s{k}]")
+        mix.append(f"[s{k}]")
+    if typing_dur:
+        idx = nxt + len(sfx_times)
+        parts.append(f"[{idx}:a]{fmt},atrim=0:{typing_dur:.2f},volume={TYPING_DB}dB,"
+                     f"afade=t=out:st={max(0.0, typing_dur - 0.12):.2f}:d=0.12[typ]")
+        mix.append("[typ]")
+    parts.append(f"{''.join(mix)}amix=inputs={len(mix)}:normalize=0:duration=first,"
+                 f"alimiter=limit=0.95[aout]")
+    return ";".join(parts)
+
+
+def apply(video_in, video_out, plan, music_path=None, music_db=MUSIC_DB, cam_h=None, shake=False,
+          typing_dur=None):
+    """Mix music + effects (+ punches) into an already-edited clip. With `cam_h` (facecam-top
+    layout) a punch cuts to the streamer's face full-screen; otherwise it is a quick zoom."""
+    lib = sfx_library()
+    duration = _duration(video_in)
+    sfx = [s for s in plan.get("sfx", []) if s["sound"] in lib and s["time"] < duration - 0.2]
+    inputs = ["-i", video_in]
+    if music_path:
+        offset = random.uniform(0, max(0.0, _duration(music_path) - duration - 2)) * 0.5
+        inputs += ["-ss", f"{offset:.1f}", "-stream_loop", "-1", "-i", music_path]
+    for s in sfx:
+        inputs += ["-i", lib[s["sound"]]]
+    if typing_dur and not os.path.exists(TYPING_FILE):
+        typing_dur = None
+    if typing_dur:
+        inputs += ["-stream_loop", "-1", "-i", TYPING_FILE]
+    graph = audio_graph(len(sfx), [s["time"] for s in sfx], duration, bool(music_path), music_db,
+                        typing_dur=typing_dur)
+    # video: face punch / zoom punch, then shakes on the stream's own loud peaks
+    punches = [s["time"] for s in sfx if s.get("punch")]
+    shakes = loud_peaks(video_in) if shake else []
+    # no shake while the face punch is on screen (it already moves), keep them apart
+    shakes = [t for t in shakes if all(not (p - 0.3 <= t <= p + FACE_HOLD + 0.3) for p in punches)]
+    vparts, vlabel = [], None
+    if punches and cam_h:
+        vparts.append(face_punch_graph(punches, cam_h))
+        vlabel = "[vp]"
+    elif punches:
+        vparts.append(f"[0:v]{punch_filter(punches)}[vp]")
+        vlabel = "[vp]"
+    if shakes:
+        vparts.append(f"{vlabel or '[0:v]'}{shake_filter(shakes)}[vs]")
+        vlabel = "[vs]"
+    if vlabel:
+        graph = ";".join(vparts) + ";" + graph
+        vmap, vcodec = vlabel, ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+    else:
+        vmap, vcodec = "0:v", ["-c:v", "copy"]
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", graph,
+                    "-map", vmap, "-map", "[aout]", *vcodec, "-c:a", "aac", "-b:a", "192k",
+                    "-t", f"{duration:.2f}", "-movflags", "+faststart", video_out], check=True)
+    return {"music": os.path.basename(music_path) if music_path else None, "mood": plan.get("mood"),
+            "sfx": sfx, "shakes": shakes}
+
+
