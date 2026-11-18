@@ -138,3 +138,29 @@ def score_at(messages, now, started_at, window=WINDOW, baseline=BASELINE):
     }
 
 
+class Detector:
+    """Turns chat scores into highlight events: threshold, minimum volume, cooldown, peak."""
+
+    def __init__(self, threshold=60, cooldown=40.0, min_msgs=MIN_MSGS):
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.min_msgs = min_msgs
+        self.last_trigger = 0.0
+        self.active = None  # (start_time, best_score) while a spike is in progress
+
+    def update(self, now, s):
+        """Feed one score dict; returns (spike_start_time, peak_score) when a spike ends."""
+        hot = s["ready"] and s["msgs"] >= self.min_msgs and s["score"] >= self.threshold
+        if self.active is None:
+            if hot and now - self.last_trigger >= self.cooldown:
+                self.active = (now, s["score"])
+            return None
+        start, best = self.active
+        best = max(best, s["score"])
+        # A spike ends when chat calms down or after 8 s, whichever comes first.
+        if not hot or now - start >= 8:
+            self.active = None
+            self.last_trigger = now
+            return start, best
+        self.active = (start, best)
+        return None
