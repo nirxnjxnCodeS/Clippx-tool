@@ -295,3 +295,36 @@ def apply(video_in, video_out, plan, music_path=None, music_db=MUSIC_DB, cam_h=N
             "sfx": sfx, "shakes": shakes}
 
 
+# ---------------------------------------------------------------- CLI: remix an existing clip
+def main():
+    p = argparse.ArgumentParser(description="Add music + sound effects to an existing clip.")
+    p.add_argument("clip")
+    p.add_argument("--sfx-max", type=int, default=2)
+    p.add_argument("--channel", default=None)
+    p.add_argument("--no-music", action="store_true")
+    p.add_argument("--music-db", type=float, default=MUSIC_DB)
+    p.add_argument("--no-shake", action="store_true", help="no shake on loud peaks")
+    p.add_argument("--cam-h", type=int, default=None,
+                   help="facecam band height (px) for face punches; read from the clip's .json if present")
+    args = p.parse_args()
+    if args.cam_h is None:
+        try:
+            args.cam_h = json.load(open(re.sub(r"\.mp4$", ".json", args.clip))).get("cam_h")
+        except (OSError, ValueError):
+            pass
+    sys.path.insert(0, HERE)
+    import pipeline
+    channel = args.channel or os.path.basename(os.path.dirname(os.path.abspath(args.clip)))
+    words = pipeline.transcribe(args.clip)
+    edit = pipeline.ai_hook(channel, words, args.sfx_max)      # the same single call live clips use
+    plan = edit["plan"]
+    print(f"hook: {' / '.join(edit['hook'])}\ncaption: {edit['caption']}")
+    music = None if args.no_music else pick_music(plan["mood"])
+    out = re.sub(r"\.mp4$", f"_fx{args.sfx_max}{'' if args.no_shake else 's'}.mp4", args.clip)
+    info = apply(args.clip, out, plan, music, args.music_db, cam_h=args.cam_h, shake=not args.no_shake)
+    print(json.dumps(info, indent=1))
+    print(f"made {out}")
+
+
+if __name__ == "__main__":
+    main()
