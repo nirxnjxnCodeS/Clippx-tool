@@ -195,3 +195,104 @@ def ai_hook(channel, words, sfx_max=0, tags=None):
         return fallback
 
 
+# ---------------------------------------------------------------- styling
+TYPE_CPS = 22          # typewriter speed, characters per second
+TYPE_FPS = 30
+
+
+def _hook_image(lines, shown=None, size=56):
+    """Pill hook on a canvas sized for the FULL text; `shown` = how many characters to draw
+    (typewriter frames), None = all. Same canvas size for every frame, so frames line up."""
+    font = ImageFont.truetype(FONT, size)
+    pad_x, pad_y, gap, radius = 34, 18, 10, 22
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    _, t_ref, _, b_ref = probe.textbbox((0, 0), "HAWQ", font=font)   # fixed line height
+    line_h = b_ref - t_ref
+    widths = [probe.textbbox((0, 0), text, font=font)[2] for text in lines]
+    width = max(widths) + 2 * pad_x + 40
+    height = len(lines) * (line_h + 2 * pad_y) + gap * (len(lines) - 1) + 40
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    left = len("".join(lines)) if shown is None else shown
+    y = 20
+    for text in lines:
+        part, left = text[:max(0, left)], left - len(text)
+        if part.strip():
+            l, _, r, _ = d.textbbox((0, 0), part, font=font)
+            bw, bh = (r - l) + 2 * pad_x, line_h + 2 * pad_y
+            x = (width - bw) // 2
+            d.rounded_rectangle((x + 5, y + 6, x + bw + 5, y + bh + 6), radius, fill=(0, 0, 0, 110))
+            d.rounded_rectangle((x, y, x + bw, y + bh), radius, fill=(255, 255, 255, 255))
+            d.text((x + pad_x - l, y + pad_y - t_ref), part, font=font, fill=(10, 10, 10, 255))
+        y += line_h + 2 * pad_y + gap
+    return img.rotate(2, resample=Image.BICUBIC, expand=True)
+
+
+def cover_hook_png(old, new, path, size=56):
+    """A new hook drawn over an already-burned one: every pill is at least as wide as the
+    old pill it sits on, on the same canvas, so nothing of the old text shows through."""
+    font = ImageFont.truetype(FONT, size)
+    pad_x, pad_y, gap, radius = 34, 18, 10, 22
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    _, t_ref, _, b_ref = probe.textbbox((0, 0), "HAWQ", font=font)
+    line_h = b_ref - t_ref
+    tw = lambda s: probe.textbbox((0, 0), s, font=font)[2]
+    rows = max(len(old), len(new))
+    old = list(old) + [""] * (rows - len(old))
+    new = list(new) + [""] * (rows - len(new))
+    width = max(tw(s) for s in old + new if s) + 2 * pad_x + 40
+    height = rows * (line_h + 2 * pad_y) + gap * (rows - 1) + 40
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    y = 20
+    for o, n in zip(old, new):
+        w = max(tw(o) if o.strip() else 0, tw(n) if n.strip() else 0)
+        if w:
+            bw, bh = w + 2 * pad_x, line_h + 2 * pad_y
+            x = (width - bw) // 2
+            d.rounded_rectangle((x + 5, y + 6, x + bw + 5, y + bh + 6), radius, fill=(0, 0, 0, 110))
+            d.rounded_rectangle((x, y, x + bw, y + bh), radius, fill=(255, 255, 255, 255))
+            if n.strip():
+                left = d.textbbox((0, 0), n, font=font)[0]
+                d.text((x + (bw - tw(n)) // 2 - left, y + pad_y - t_ref), n, font=font, fill=(10, 10, 10, 255))
+        y += line_h + 2 * pad_y + gap
+    img.rotate(2, resample=Image.BICUBIC, expand=True).save(path)
+
+
+def replace_hook(clip, new_hook, out=None, start=None):
+    """Re-hook a finished clip (fix a wrong/weak hook), optionally trimming from `start` s."""
+    meta = json.load(open(clip[:-4] + ".json"))
+    seam = meta.get("cam_h")
+    out = out or clip[:-4] + "_edit.mp4"
+    with tempfile.TemporaryDirectory() as tmp:
+        png = os.path.join(tmp, "h.png")
+        cover_hook_png(meta.get("hook", []), new_hook, png)
+        y = f"{seam}-h/2" if seam else "250"
+        cmd = ["ffmpeg", "-v", "error", "-y"]
+        if start:
+            cmd += ["-ss", str(start)]
+        cmd += ["-i", clip, "-i", png, "-filter_complex", f"[0:v][1:v]overlay=(W-w)/2:{y},format=yuv420p[v]",
+                "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out]
+        subprocess.run(cmd, check=True)
+    return out
+
+
+def hook_png(lines, path, size=56):
+    _hook_image(lines, None, size).save(path)
+
+
+def typing_seconds(lines):
+    return len("".join(lines)) / TYPE_CPS
+
+
+def hook_typewriter_frames(lines, folder):
+    """PNG frames (TYPE_FPS) of the hook typing itself out; the last frame is the full hook."""
+    total = len("".join(lines))
+    n = int(total / TYPE_CPS * TYPE_FPS) + 2
+    for i in range(n):
+        shown = min(total, int(i / TYPE_FPS * TYPE_CPS) + 1)
+        _hook_image(lines, shown).save(os.path.join(folder, f"h_{i:04d}.png"))
+    return os.path.join(folder, "h_%04d.png")
+
+
