@@ -140,3 +140,80 @@ def ai_plan(channel, words, sfx_max):
         return {"mood": "hype", "sfx": []}
 
 
+# ---------------------------------------------------------------- render
+def _duration(path):
+    out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                   "-of", "csv=p=0", path])
+    return float(out.decode().strip())
+
+
+FACE_HOLD = 0.9       # seconds the facecam fills the screen on a reaction punch
+
+
+def punch_filter(punches, w=1080, h=1920):
+    """Video filter: brief zoom-in at each punch time (empty string if none)."""
+    if not punches:
+        return ""
+    z = "+".join(f"between(t,{t:.2f},{t + 0.25:.2f})" for t in punches)
+    return (f"scale=w='trunc({w}*(1+{PUNCH_ZOOM}*({z}))/2)*2':h=-2:eval=frame,"
+            f"crop={w}:{h}:(iw-{w})/2:(ih-{h})/2")
+
+
+SHAKE_PX = 14         # max shake offset in pixels
+SHAKE_SECONDS = 0.35
+SHAKE_MAX = 3
+
+
+def loud_peaks(video, max_peaks=SHAKE_MAX, min_gap=2.5):
+    """Times (s) where the clip's own audio jumps well above its normal level: screams, hype.
+    Rules: >= 10 dB above the clip's median, louder than -18 dBFS, a local peak, >= min_gap apart,
+    not in the first 0.5 s. Returns the loudest few, in time order."""
+    import numpy as np
+    sr, hop = 16000, 800  # 50 ms windows
+    pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", str(sr),
+                          "-f", "s16le", "-"], capture_output=True).stdout
+    x = np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
+    n = len(x) // hop
+    if n < 20:
+        return []
+    rms = np.sqrt((x[:n * hop].reshape(n, hop) ** 2).mean(1)) + 1e-9
+    db = 20 * np.log10(rms)
+    smooth = np.convolve(db, np.ones(3) / 3, mode="same")
+    floor = max(float(np.median(smooth)) + 10, -18.0)
+    cands = [i for i in range(10, n - 1)
+             if smooth[i] >= floor and smooth[i] >= smooth[i - 1] and smooth[i] >= smooth[i + 1]]
+    cands.sort(key=lambda i: smooth[i], reverse=True)
+    picked = []
+    for i in cands:
+        t = i * hop / sr
+        if all(abs(t - p) >= min_gap for p in picked):
+            picked.append(t)
+        if len(picked) >= max_peaks:
+            break
+    return sorted(round(t, 2) for t in picked)
+
+
+def shake_filter(times, w=1080, h=1920):
+    """Camera shake that decays over SHAKE_SECONDS at each time. Zooms 4% so edges never show."""
+    if not times:
+        return ""
+    env = "+".join(f"between(t,{t:.2f},{t + SHAKE_SECONDS:.2f})*(1-(t-{t:.2f})/{SHAKE_SECONDS})"
+                   for t in times)
+    zw, zh = int(w * 1.04) // 2 * 2, int(h * 1.04) // 2 * 2
+    return (f"scale={zw}:{zh},"
+            f"crop={w}:{h}:x='({zw}-{w})/2+{SHAKE_PX}*sin(t*83)*({env})':"
+            f"y='({zh}-{h})/2+{SHAKE_PX}*cos(t*71)*({env})'")
+
+
+def face_punch_graph(punches, cam_h, w=1080, h=1920):
+    """Facecam layout: on each punch, the facecam band (top cam_h px) fills the whole screen
+    for FACE_HOLD s, with a small push-in, so the streamer's reaction is what you see."""
+    on = "+".join(f"between(t,{max(0.0, t - 0.1):.2f},{t + FACE_HOLD:.2f})" for t in punches)
+    push = "+".join(f"between(t,{max(0.0, t - 0.1):.2f},{t + FACE_HOLD:.2f})*"
+                    f"(1+0.06*min(1,(t-{max(0.0, t - 0.1):.2f})/{FACE_HOLD}))" for t in punches)
+    return (f"[0:v]split[base][c];"
+            f"[c]crop={w}:{cam_h}:0:0,scale=-2:{h},crop={w}:{h},"
+            f"scale=w='trunc({w}*max(1,{push})/2)*2':h=-2:eval=frame,crop={w}:{h},setsar=1[face];"
+            f"[base][face]overlay=0:0:enable='{on}'[vp]")
+
+
