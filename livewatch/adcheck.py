@@ -41,3 +41,16 @@ def ad_seconds(path):
     return [is_ad_frame(f) for f in frames_per_second(path)]
 
 
+def clean_span(flags, min_len=15):
+    """Longest run of non-ad seconds as (start, end) in seconds, or None if shorter than min_len."""
+    best, start = None, None
+    for i, ad in enumerate(list(flags) + [True]):
+        if not ad and start is None:
+            start = i
+        elif ad and start is not None:
+            if best is None or i - start > best[1] - best[0]:
+                best = (start, i)
+            start = None
+    if best and best[1] - best[0] >= min_len:
+        return best
+    return None
