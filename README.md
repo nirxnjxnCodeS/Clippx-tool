@@ -1,3 +1,5 @@
+> **Clippx** clips live Twitch and YouTube streams into post-ready 9:16 shorts while the stream is still running: see [livewatch/README.md](livewatch/README.md). Clippx is built on [OpenShorts](https://github.com/mutonby/openshorts) (MIT); the rest of this README is the upstream OpenShorts documentation.
+
 # OpenShorts.app
 
 **The open-source OpusClip alternative.** Turn long videos into viral 9:16 Shorts, TikToks and Reels. Self-host free (MIT) or use the hosted cloud.

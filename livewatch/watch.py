@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""livewatch: a self-hosted Klypra. Watches a live Twitch channel, clips the moments
-chat reacts to, and edits them into post-ready 9:16 clips.
+"""livewatch: watches a live Twitch or YouTube stream, clips the moments chat reacts
+to, and edits them into post-ready 9:16 clips.
 
 Run inside the OpenShorts container (it has ffmpeg, yt-dlp, whisper and the
 face tracking):
 
     docker exec -it -w /app openshorts-backend python livewatch/watch.py lacy
     docker exec -it -w /app openshorts-backend python livewatch/watch.py lacy --threshold 70 --auto
+    docker exec -it -w /app openshorts-backend python livewatch/watch.py @somestreamer --auto
+    docker exec -it -w /app openshorts-backend python livewatch/watch.py "https://youtu.be/<id>"
 
 Clips land in livewatch/clips/<channel>/ with a gallery at livewatch/clips/index.html.
 Optional: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env sends each clip to your phone.
@@ -27,6 +29,7 @@ sys.path.insert(0, HERE)
 import chat as chatmod  # noqa: E402
 import pipeline  # noqa: E402
 import recorder  # noqa: E402
+import sources  # noqa: E402
 
 CLIPS = os.path.join(HERE, "clips")
 
@@ -41,7 +44,8 @@ def editor_worker(jobs, args, counters):
             pipeline.make_clip(raw, args.channel, score, CLIPS, stream_time=when,
                                hook_ai=not args.no_hook, sfx_max=args.sfx_max,
                                music=not args.no_music, music_db=args.music_db,
-                               shake=not args.no_shake, tags=args.tags, facecam=args.facecam)
+                               shake=not args.no_shake, tags=args.tags, facecam=args.facecam,
+                               platform=args.platform)
             counters["made"] += 1
         except Exception as e:
             print(f"[edit] failed: {type(e).__name__}: {e}", flush=True)
@@ -83,7 +87,7 @@ def drop_ads(raw, min_len=15):
     return True
 
 
-def cutter(seg_dir, t0, t1, score, jobs, work_dir, counters):
+def cutter(seg_dir, t0, t1, score, jobs, work_dir, counters, check_ads=True):
     # wait until the "after" part has been recorded (plus one segment of slack)
     time.sleep(max(0.0, t1 - time.time()) + recorder.SEGMENT + 2)
     raw = os.path.join(work_dir, f"raw_{int(t0)}.mp4")
@@ -92,10 +96,10 @@ def cutter(seg_dir, t0, t1, score, jobs, work_dir, counters):
     except Exception as e:
         print(f"[clip] cut failed: {e}", flush=True)
         ok = False
-    if ok:
+    if ok and check_ads:                          # the commercial-break screen is Twitch-only
         ok = drop_ads(raw)
     if not ok:
-        print("[clip] skipped (nothing recorded, or Twitch commercial break)", flush=True)
+        print("[clip] skipped (nothing recorded, or a commercial break)", flush=True)
     elif jobs.qsize() >= 8:
         print("[clip] editor is behind; skipping this one", flush=True)
         os.remove(raw)
@@ -109,11 +113,12 @@ def s_ready(reader, now):
     return reader.started_at is not None and now - reader.started_at >= chatmod.WARMUP
 
 
-def wait_until_live(channel, poll=60):
-    print(f"[auto] waiting for {channel} to go live (checking every {poll}s)...", flush=True)
-    while not recorder.stream_url(channel):
+def wait_until_live(source, poll=60):
+    print(f"[auto] waiting for {source.name} ({source.label}) to go live (checking every {poll}s)...",
+          flush=True)
+    while not recorder.stream_url(source):
         time.sleep(poll)
-    print(f"[auto] {channel} is live", flush=True)
+    print(f"[auto] {source.name} is live", flush=True)
 
 
 def watch(args):
@@ -124,9 +129,9 @@ def watch(args):
     import glob as _glob
     leftovers = sorted(_glob.glob(os.path.join(work, "raw_*.mp4")))  # cut but not edited last run
 
-    rec = recorder.Recorder(args.channel, seg_dir, buffer_seconds=args.before + args.after + 240,
+    rec = recorder.Recorder(args.source, seg_dir, buffer_seconds=args.before + args.after + 240,
                             use_streamlink=not args.no_adblock)
-    reader = chatmod.ChatReader(args.channel)
+    reader = chatmod.reader_for(args.source)
     det = chatmod.Detector(threshold=args.threshold, cooldown=args.cooldown, min_msgs=args.min_msgs)
     jobs = queue.Queue()
     counters = {"made": 0, "detected": 0, "pending": 0}
@@ -148,7 +153,7 @@ def watch(args):
     clip_times = []
     base_threshold = args.threshold
     last_adjust = started
-    print(f"[watch] {args.channel}: threshold {args.threshold}, clip = {args.before}s before + "
+    print(f"[watch] {args.channel} ({args.source.label}): threshold {args.threshold}, clip = {args.before}s before + "
           f"{args.after}s after, max {args.max_clips} clips, {args.hours}h. Ctrl+C to stop.",
           flush=True)
     try:
@@ -190,12 +195,18 @@ def watch(args):
                 t0, t1 = spike_start - args.before, spike_start + args.after
                 print(f"\n[clip] 🔥 highlight #{counters['detected']}: score {peak} "
                       f"({s['rate']:.1f} msg/s vs normal {s['normal']:.1f}); cutting...", flush=True)
-                threading.Thread(target=cutter, args=(seg_dir, t0, t1, peak, jobs, work, counters),
+                threading.Thread(target=cutter, args=(seg_dir, t0, t1, peak, jobs, work, counters,
+                                                      args.platform == "twitch"),
                                  daemon=True).start()
             if now - last_status >= 5:
                 last_status = now
                 state = "warming up" if not s["ready"] else f"score {s['score']:>3}/{det.threshold}"
-                rec_state = ("rec ● ads✂" if rec.ads_filtered else "rec ● ADS ON") if rec.recording() else "rec …"
+                if not rec.recording():
+                    rec_state = "rec …"
+                elif args.platform != "twitch":
+                    rec_state = "rec ●"
+                else:
+                    rec_state = "rec ● ads✂" if rec.ads_filtered else "rec ● ADS ON"
                 chat_state = "chat ●" if reader.connected else "chat …"
                 print(f"[meter] {rec_state} {chat_state} | {s['rate']:.1f} msg/s · normal "
                       f"{s['normal']:.1f} · {state} · clips {counters['made']}/{counters['detected']}",
@@ -233,12 +244,15 @@ def test_file(args):
                     "-preset", "veryfast", "-crf", "18", "-c:a", "aac", raw], check=True)
     pipeline.make_clip(raw, args.channel, 99, CLIPS, hook_ai=not args.no_hook, sfx_max=args.sfx_max,
                        music=not args.no_music, music_db=args.music_db, shake=not args.no_shake,
-                       tags=args.tags, facecam=args.facecam)
+                       tags=args.tags, facecam=args.facecam, platform=args.platform)
 
 
 def main():
-    p = argparse.ArgumentParser(description="Self-hosted live Twitch clipper.")
-    p.add_argument("channel", nargs="?", help="Twitch channel name, e.g. lacy")
+    p = argparse.ArgumentParser(description="Self-hosted live clipper for Twitch and YouTube.")
+    p.add_argument("target", nargs="?",
+                   help="Twitch channel (lacy, twitch.tv/lacy) or YouTube live (@handle, watch/live URL)")
+    p.add_argument("--name", default=None,
+                   help="name for the clips folder, notes file and captions (default: from the target)")
     p.add_argument("--threshold", type=int, default=60,
                    help="clip sensitivity 40-90 (lower = more clips). Default 60 = about 2x normal chat")
     p.add_argument("--before", type=int, default=30, help="seconds kept before the chat spike")
@@ -264,7 +278,8 @@ def main():
     p.add_argument("--no-adblock", action="store_true",
                    help="record directly (no streamlink ad skipping); use if recording keeps failing")
     p.add_argument("--tags", default=None,
-                   help='hashtags every caption must carry, e.g. "#LACY #GTA6" (default "#<channel> #twitch")')
+                   help='hashtags every caption must carry, e.g. "#LACY #GTA6" '
+                        '(default "#<name> #twitch" or "#<name> #shorts")')
     p.add_argument("--music-db", type=float, default=-20.0,
                    help="background music level in dB (-24 quieter, -16 louder)")
     p.add_argument("--test-file", help="edit a local video instead of watching Twitch")
@@ -279,16 +294,20 @@ def main():
             p.error("--facecam must be x,y,w,h, e.g. 60,0,400,278")
 
     if args.test_file:
-        args.channel = args.test_channel
+        args.channel = sources.safe_name(args.name or args.test_channel)
+        args.platform = "twitch"
         return test_file(args)
-    if not args.channel or not recorder.valid_channel(args.channel):
-        p.error("give a Twitch channel name (letters, numbers, underscore)")
-    args.channel = args.channel.lower()
+    try:
+        args.source = sources.parse(args.target)
+    except ValueError as e:
+        p.error(str(e))
+    args.platform = args.source.platform
+    args.channel = sources.safe_name(args.name) if args.name else args.source.name
     args.threshold = max(40, min(90, args.threshold))
     while True:
         if args.auto:
-            wait_until_live(args.channel)
-        elif not recorder.stream_url(args.channel):
+            wait_until_live(args.source)
+        elif not recorder.stream_url(args.source):
             print(f"{args.channel} is offline. Use --auto to wait for them to go live.")
             return
         watch(args)

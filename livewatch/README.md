@@ -1,11 +1,12 @@
 # livewatch
 
-Watches a live stream, clips the moments chat reacts to, and edits each one into a
+Watches a live Twitch or YouTube stream, clips the moments chat reacts to, and edits each one into a
 post-ready 9:16 short. It needs no clipping service and runs on your own machine.
 
 ```
 chat.py       anonymous chat reader + spike detector (the "clip meter")
 recorder.py   rolling 2 s segments of the stream, cut by wall-clock time
+sources.py    Twitch channel / YouTube live URL -> what to record and read
 adcheck.py    drops / trims Twitch "commercial break" screens
 pipeline.py   transcribe -> 9:16 layout (facecam on top, face tracking, or centre crop)
               -> AI hook + caption -> captions + pill hook -> gallery / Telegram
@@ -30,8 +31,20 @@ The editor needs the OpenShorts container: it has ffmpeg, yt-dlp, faster-whisper
 
 ```bash
 docker compose up -d backend
-docker exec -it -w /app openshorts-backend python livewatch/watch.py <channel> --auto
+docker exec -it -w /app openshorts-backend python livewatch/watch.py <target> --auto
 ```
+
+`<target>` can be any of:
+
+| platform | examples |
+|---|---|
+| Twitch | `lacy`, `twitch.tv/lacy`, `https://www.twitch.tv/lacy` |
+| YouTube | `@handle`, `youtube.com/@handle/live`, `https://youtu.be/<id>`, `youtube.com/live/<id>` |
+
+On YouTube, chat is read with the YouTube Data API when `YOUTUBE_API_KEY` is set in `.env`.
+Every poll uses API quota, so a long stream can exhaust a default key. Without a key, the
+`chat-downloader` package is used instead. Use `--name` to choose the clips folder and the
+caption name, which otherwise come from the handle or video id.
 
 Clips land in `livewatch/clips/<channel>/`, and the gallery is at `livewatch/clips/index.html`.
 

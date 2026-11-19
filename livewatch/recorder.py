@@ -1,4 +1,4 @@
-"""Rolling recording of a live Twitch stream, cut into short wall-clock-named segments.
+"""Rolling recording of a live stream (Twitch or YouTube), cut into short wall-clock-named segments.
 
 The stream is copied (no re-encode) into 2-second .ts files named by their start
 time in epoch seconds, so any moment can be cut out afterwards by wall-clock time.
@@ -12,6 +12,8 @@ import subprocess
 import threading
 import time
 
+import sources
+
 CHANNEL_RE = re.compile(r"^[a-z0-9_]{3,25}$")
 SEGMENT = 2  # seconds
 
@@ -20,14 +22,18 @@ def valid_channel(name):
     return bool(CHANNEL_RE.match(name.lower()))
 
 
-def stream_url(channel, max_height=1080):
-    """HLS URL of a live channel, or None when it is offline."""
-    if not valid_channel(channel):
-        raise ValueError(f"not a Twitch channel name: {channel!r}")
-    proc = subprocess.run(
-        ["yt-dlp", "-g", "--no-warnings", "-f", f"best[height<={max_height}]/best",
-         f"https://www.twitch.tv/{channel.lower()}"],
-        capture_output=True, text=True, timeout=60)
+def as_source(target):
+    """A Source; a bare string is parsed (a plain name is a Twitch channel)."""
+    return target if isinstance(target, sources.Source) else sources.parse(target)
+
+
+def stream_url(target, max_height=1080):
+    """HLS URL of a live stream, or None when it is offline."""
+    src = as_source(target)
+    cmd = ["yt-dlp", "-g", "--no-warnings", "-f", f"best[height<={max_height}]/best"]
+    if src.platform == "youtube":
+        cmd += ["--no-playlist", "--match-filter", "is_live"]   # only an ongoing live, not a VOD
+    proc = subprocess.run(cmd + [src.url], capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
         return None
     url = proc.stdout.strip().splitlines()
@@ -35,10 +41,12 @@ def stream_url(channel, max_height=1080):
 
 
 class Recorder(threading.Thread):
-    def __init__(self, channel, seg_dir, buffer_seconds=300, use_streamlink=True):
+    def __init__(self, target, seg_dir, buffer_seconds=300, use_streamlink=True):
         super().__init__(daemon=True)
-        self.use_streamlink = use_streamlink
-        self.channel = channel
+        self.source_info = as_source(target)
+        # streamlink is only used to skip Twitch's inserted ads; YouTube is recorded directly
+        self.use_streamlink = use_streamlink and self.source_info.platform == "twitch"
+        self.channel = self.source_info.name
         self.seg_dir = seg_dir
         self.buffer = buffer_seconds
         self.stop_event = threading.Event()
@@ -52,7 +60,7 @@ class Recorder(threading.Thread):
         log_path = os.path.join(os.path.dirname(self.seg_dir), "recorder.log")
         quick_fails = 0
         while not self.stop_event.is_set():
-            url = stream_url(self.channel)
+            url = stream_url(self.source_info)
             if not url:
                 self.offline_since = self.offline_since or time.time()
                 self.stop_event.wait(20)
@@ -72,7 +80,7 @@ class Recorder(threading.Thread):
                 # --twitch-disable-ads switch no longer exists), so ads never reach the recording.
                 self.source = subprocess.Popen(
                     ["streamlink", "--loglevel", "warning", "--stdout",
-                     f"https://www.twitch.tv/{self.channel.lower()}", "1080p60,1080p,best"],
+                     self.source_info.url, "1080p60,1080p,best"],
                     stdout=subprocess.PIPE, stderr=log)
                 # -re: streamlink hands over video in bursts; read it at real-time speed so each
                 # 2 s segment is written in its own wall-clock second. Without it several segments
