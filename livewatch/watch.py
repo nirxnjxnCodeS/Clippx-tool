@@ -253,6 +253,9 @@ def main():
                    help="Twitch channel (lacy, twitch.tv/lacy) or YouTube live (@handle, watch/live URL)")
     p.add_argument("--name", default=None,
                    help="name for the clips folder, notes file and captions (default: from the target)")
+    p.add_argument("--youtube", default=None,
+                   help="YouTube live URL; the positional argument is then the --name, e.g. "
+                        "dylan --youtube https://www.youtube.com/@dylan.page./live")
     p.add_argument("--threshold", type=int, default=60,
                    help="clip sensitivity 40-90 (lower = more clips). Default 60 = about 2x normal chat")
     p.add_argument("--before", type=int, default=30, help="seconds kept before the chat spike")
@@ -297,10 +300,15 @@ def main():
         args.channel = sources.safe_name(args.name or args.test_channel)
         args.platform = "twitch"
         return test_file(args)
+    if args.youtube:                      # older form: <name> --youtube <url>
+        args.name = args.name or args.target
+        args.target = args.youtube
     try:
         args.source = sources.parse(args.target)
     except ValueError as e:
         p.error(str(e))
+    if args.youtube and args.source.platform != "youtube":
+        p.error("--youtube must be a YouTube live URL")
     args.platform = args.source.platform
     args.channel = sources.safe_name(args.name) if args.name else args.source.name
     args.threshold = max(40, min(90, args.threshold))
