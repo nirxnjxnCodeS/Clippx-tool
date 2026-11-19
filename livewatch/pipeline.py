@@ -125,6 +125,10 @@ def _load_env():
             os.environ[m.group(1)] = m.group(2)
 
 
+def default_tags(channel, platform="twitch"):
+    return f"#{channel} #{'twitch' if platform == 'twitch' else 'shorts'}"
+
+
 def ensure_tags(caption, channel, tags):
     """Campaign rules (e.g. Lacy): the caption must name the streamer and carry the hashtags."""
     caption = caption.strip()
@@ -136,11 +140,11 @@ def ensure_tags(caption, channel, tags):
     return caption
 
 
-def ai_hook(channel, words, sfx_max=0, tags=None):
+def ai_hook(channel, words, sfx_max=0, tags=None, platform="twitch"):
     """ONE Claude call (via the bridge) for the whole edit:
     {'hook': [line1, line2], 'caption': str, 'plan': {'mood', 'sfx'}}; plain fallback on failure."""
     import audiofx
-    tags = tags or f"#{channel} #twitch"
+    tags = tags or default_tags(channel, platform)
     fallback = {"hook": [], "caption": ensure_tags(f"{channel.upper()} moment 😭", channel, tags),
                 "plan": {"mood": "hype", "sfx": []}}
     _load_env()
@@ -163,7 +167,7 @@ def ai_hook(channel, words, sfx_max=0, tags=None):
     notes = open(notes_path).read().strip() if os.path.exists(notes_path) else ""
     prompt = (
         (f"Facts you must respect (pronouns, names):\n{notes}\n\n" if notes else "") +
-        f"Transcript of a ~40 second Twitch clip of the streamer {channel}, each word numbered [n]:\n"
+        f"Transcript of a ~40 second {'Twitch' if platform == 'twitch' else 'YouTube'} live clip of the streamer {channel}, each word numbered [n]:\n"
         f"{numbered}\n\n"
         "Write JSON with:\n"
         '- "hook1" and "hook2": an on-screen hook in two short lines, UPPERCASE, max 24 '
@@ -430,7 +434,8 @@ def _glob(root, pattern):
 
 
 def make_clip(raw, channel, score, clips_root, stream_time="", hook_ai=True,
-              sfx_max=2, music=True, music_db=None, shake=True, tags=None, facecam=None):
+              sfx_max=2, music=True, music_db=None, shake=True, tags=None, facecam=None,
+              platform="twitch"):
     """Full edit of one raw cut. Returns the final mp4 path."""
     import audiofx
     t0 = time.time()
@@ -443,8 +448,8 @@ def make_clip(raw, channel, score, clips_root, stream_time="", hook_ai=True,
         vertical = os.path.join(tmp, "v.mp4")
         words = transcribe(raw)
         layout, caption_y = reframe(raw, vertical, facecam)
-        info = (ai_hook(channel, words, sfx_max, tags) if hook_ai else
-                {"hook": [], "caption": ensure_tags("", channel, tags or f"#{channel}"),
+        info = (ai_hook(channel, words, sfx_max, tags, platform) if hook_ai else
+                {"hook": [], "caption": ensure_tags("", channel, tags or default_tags(channel, platform)),
                  "plan": {"mood": "hype", "sfx": []}})
         # sound design + motion go on BEFORE the text, so punches/shakes never move the hook/captions
         if music or sfx_max > 0 or shake:
@@ -463,7 +468,7 @@ def make_clip(raw, channel, score, clips_root, stream_time="", hook_ai=True,
         os.makedirs(out_dir, exist_ok=True)   # recreate if the clips folder was cleaned mid-run
         style(vertical, final, words, info["hook"], caption_y,
               typewriter=bool(info.get("plan", {}).get("typewriter")))
-    meta = {"channel": channel, "score": score, "time": stream_time or time.strftime("%H:%M:%S"),
+    meta = {"channel": channel, "platform": platform, "score": score, "time": stream_time or time.strftime("%H:%M:%S"),
             "layout": layout, "cam_h": caption_y, "hook": info["hook"], "caption": info["caption"],
             "mood": sound.get("mood"), "music": sound.get("music"),
             "sfx": [f"{s['sound']}@{s['time']}s" for s in sound.get("sfx", [])],
