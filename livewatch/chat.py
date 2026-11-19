@@ -1,19 +1,24 @@
-"""Live Twitch chat reader + highlight detector (the "clip meter").
+"""Live chat readers (Twitch, YouTube) + highlight detector (the "clip meter").
 
-Reads a channel's public chat anonymously over Twitch IRC (no login needed) and
-scores each moment by how fast chat is moving compared with that channel's own
+Twitch: the channel's public chat, read anonymously over IRC (no login needed).
+YouTube: the live chat through the YouTube Data API when YOUTUBE_API_KEY is set,
+otherwise through the chat-downloader package (no key).
+Each moment is scored each moment by how fast chat is moving compared with that channel's own
 normal pace, plus how repetitive it is (everyone spamming the same emote /
 copypasta). A score at or above the threshold is a highlight.
 """
 import bisect
 import collections
 import math
+import os
 import random
 import socket
 import ssl
 import statistics
+import subprocess
 import threading
 import time
+from datetime import datetime
 
 IRC_HOST, IRC_PORT = "irc.chat.twitch.tv", 6697
 
@@ -83,6 +88,11 @@ class ChatReader(threading.Thread):
 
     def add(self, ts, user, text):
         with self.lock:
+            # score_at() needs messages in time order; platforms that send their own
+            # timestamps (YouTube) can deliver slightly out of order, and never from the future
+            ts = min(ts, time.time())
+            if self.messages and ts < self.messages[-1][0]:
+                ts = self.messages[-1][0]
             self.messages.append((ts, user, text))
             cutoff = ts - self.keep
             while self.messages and self.messages[0][0] < cutoff:
@@ -94,6 +104,104 @@ class ChatReader(threading.Thread):
 
     def stop(self):
         self.stop_event.set()
+
+
+class YouTubeChatReader(ChatReader):
+    """Live chat of one YouTube live stream (by URL), same interface as ChatReader."""
+
+    API = "https://www.googleapis.com/youtube/v3"
+
+    def __init__(self, url, keep=BASELINE + 60):
+        super().__init__("youtube", keep)
+        self.url = url
+        self.api_key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+
+    def _session(self):
+        if self.api_key:
+            self._api_session()
+        else:
+            self._downloader_session()
+
+    # -- official API (needs YOUTUBE_API_KEY; every poll uses quota)
+    def _video_id(self):
+        out = subprocess.run(["yt-dlp", "--no-warnings", "--no-playlist", "--print", "id", self.url],
+                             capture_output=True, text=True, timeout=60)
+        vid = out.stdout.strip().splitlines()
+        if out.returncode != 0 or not vid:
+            raise ConnectionError("stream is not live (no video id)")
+        return vid[0]
+
+    def _api_session(self):
+        import httpx
+        vid = self._video_id()
+        r = httpx.get(f"{self.API}/videos", timeout=30,
+                      params={"part": "liveStreamingDetails", "id": vid, "key": self.api_key})
+        r.raise_for_status()
+        items = r.json().get("items") or []
+        chat_id = (items[0].get("liveStreamingDetails") or {}).get("activeLiveChatId") if items else None
+        if not chat_id:
+            raise ConnectionError("this video has no active live chat")
+        self.connected = True
+        if self.started_at is None:
+            self.started_at = time.time()
+        token = None
+        while not self.stop_event.is_set():
+            params = {"liveChatId": chat_id, "part": "snippet,authorDetails", "key": self.api_key,
+                      "maxResults": 2000}
+            if token:
+                params["pageToken"] = token
+            r = httpx.get(f"{self.API}/liveChat/messages", params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            for ts, user, text in parse_api_messages(data):
+                self.add(ts, user, text)
+            token = data.get("nextPageToken")
+            self.stop_event.wait(max(2.0, data.get("pollingIntervalMillis", 5000) / 1000))
+
+    # -- chat-downloader (no key)
+    def _downloader_session(self):
+        try:
+            from chat_downloader import ChatDownloader
+        except ImportError:
+            print("[chat] YouTube chat needs YOUTUBE_API_KEY in .env or `pip install chat-downloader`",
+                  flush=True)
+            self.stop_event.wait(60)
+            return
+        chat = ChatDownloader().get_chat(self.url, message_types=["text_message"])
+        self.connected = True
+        if self.started_at is None:
+            self.started_at = time.time()
+        for msg in chat:
+            if self.stop_event.is_set():
+                break
+            ts = msg.get("timestamp")
+            ts = ts / 1e6 if ts else time.time()          # chat-downloader: microseconds
+            author = (msg.get("author") or {}).get("name", "")
+            self.add(ts, author, msg.get("message") or "")
+        raise ConnectionError("chat ended")
+
+
+def parse_api_messages(data):
+    """(epoch, author, text) for the text messages in one liveChatMessages.list response."""
+    out = []
+    for item in data.get("items") or []:
+        sn = item.get("snippet") or {}
+        if sn.get("type") != "textMessageEvent":
+            continue
+        try:
+            ts = datetime.fromisoformat(sn["publishedAt"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError):
+            ts = time.time()
+        out.append((ts, (item.get("authorDetails") or {}).get("displayName", ""),
+                    sn.get("displayMessage") or ""))
+    return out
+
+
+def reader_for(source):
+    """The chat reader for a sources.Source."""
+    if source.platform == "youtube":
+        return YouTubeChatReader(source.url)
+    return ChatReader(source.name)
 
 
 def score_at(messages, now, started_at, window=WINDOW, baseline=BASELINE):
