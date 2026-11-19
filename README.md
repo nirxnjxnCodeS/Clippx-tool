@@ -49,6 +49,9 @@ docker exec -it -w /app openshorts-backend python livewatch/watch.py <channel> -
 docker exec -it -w /app openshorts-backend python livewatch/watch.py @handle --auto
 ```
 
+Before clipping a YouTube stream, `python livewatch/yttest.py <url>` checks that the
+stream and chat can be read. It also saves a frame for measuring the facecam box.
+
 `--auto` waits for the stream to go live and starts again the next time it does. Clips
 are written to `livewatch/clips/<name>/`. Open `livewatch/clips/index.html` to watch them
 and copy their captions.
@@ -65,7 +68,6 @@ and copy their captions.
 | Variable | What it does |
 |---|---|
 | `LLM_BASE_URL`, `LLM_MODEL` | Any OpenAI-compatible server writes the hooks, captions and sound plan. To use your Claude plan, run the bridge in [`examples/claude-code-bridge/`](examples/claude-code-bridge/README.md). Without one, clips get a plain caption and no hook. |
-| `YOUTUBE_API_KEY` | Reads YouTube chat through the official API. Every poll uses quota. Without a key, the `chat-downloader` package is used. |
 | `TELEGRAM_BOT_TOKEN` | Sends every clip to your phone. Message your bot, then run `python livewatch/telegram_setup.py` once. |
 | `LW_MUSIC_DIR`, `LW_SFX_DIR` | Your own licensed music (with a `moods.json`) and sound effects. Defaults: `Music for bg/` and `sfx for shorts/`. Neither is included in the repo. |
 | `WHISPER_MODEL` | faster-whisper model for captions (default `small`). |

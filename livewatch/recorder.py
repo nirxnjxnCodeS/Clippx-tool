@@ -30,10 +30,15 @@ def as_source(target):
 def stream_url(target, max_height=1080):
     """HLS URL of a live stream, or None when it is offline."""
     src = as_source(target)
-    cmd = ["yt-dlp", "-g", "--no-warnings", "-f", f"best[height<={max_height}]/best"]
+    extra = []
     if src.platform == "youtube":
-        cmd += ["--no-playlist", "--match-filter", "is_live"]   # only an ongoing live, not a VOD
-    proc = subprocess.run(cmd + [src.url], capture_output=True, text=True, timeout=60)
+        # YouTube's default clients only list separate video/audio HLS for live streams; mweb also
+        # lists the combined ones (301 = 1080p60 + audio), which ffmpeg can record from one URL.
+        extra = ["--extractor-args", "youtube:player_client=default,mweb"]
+    proc = subprocess.run(
+        ["yt-dlp", "-g", "--no-warnings", "--no-playlist", *extra,
+         "-f", f"best[height<={max_height}][acodec!=none]/best", src.url],
+        capture_output=True, text=True, timeout=90)
     if proc.returncode != 0:
         return None
     url = proc.stdout.strip().splitlines()

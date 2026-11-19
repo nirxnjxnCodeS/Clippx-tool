@@ -41,10 +41,19 @@ docker exec -it -w /app openshorts-backend python livewatch/watch.py <target> --
 | Twitch | `lacy`, `twitch.tv/lacy`, `https://www.twitch.tv/lacy` |
 | YouTube | `@handle`, `youtube.com/@handle/live`, `https://youtu.be/<id>`, `youtube.com/live/<id>` |
 
-On YouTube, chat is read with the YouTube Data API when `YOUTUBE_API_KEY` is set in `.env`.
-Every poll uses API quota, so a long stream can exhaust a default key. Without a key, the
-`chat-downloader` package is used instead. Use `--name` to choose the clips folder and the
-caption name, which otherwise come from the handle or video id.
+On YouTube, chat is read the way the web player reads it (`ytchat.py`), using the
+"Live chat" view, which shows every message. It needs no API key and no login. Use `--name`
+to choose the clips folder and the caption name, which otherwise come from the handle or
+video id. The older form `watch.py dylan --youtube <url>` also works.
+
+Check a YouTube live before clipping it:
+
+```bash
+docker exec -it -w /app openshorts-backend python livewatch/yttest.py https://www.youtube.com/@handle/live
+```
+
+It saves one frame to `livewatch/work/yt_frame.jpg`, where you can measure the facecam
+box for `--facecam`. It then counts chat messages for 40 s.
 
 Clips land in `livewatch/clips/<channel>/`, and the gallery is at `livewatch/clips/index.html`.
 
