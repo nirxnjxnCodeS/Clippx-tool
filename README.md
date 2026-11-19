@@ -1,3 +1,5 @@
+> **Clippx – Lacy GTA 6 branch.** This branch clips Lacy's GTA 6 Twitch streams live: see [GTA6_LACY.md](GTA6_LACY.md). Clippx is built on [OpenShorts](https://github.com/mutonby/openshorts) (MIT); the rest of this README is the upstream OpenShorts documentation.
+
 # OpenShorts.app
 
 **The open-source OpusClip alternative.** Turn long videos into viral 9:16 Shorts, TikToks and Reels. Self-host free (MIT) or use the hosted cloud.
