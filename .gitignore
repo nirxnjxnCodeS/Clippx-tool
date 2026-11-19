@@ -52,3 +52,9 @@ CLAUDE.local.md
 
 # Rust build output
 osrender/target/
+
+# livewatch: recordings, finished clips and local media libraries
+livewatch/work/
+livewatch/clips/
+sfx for shorts/
+Music for bg/
