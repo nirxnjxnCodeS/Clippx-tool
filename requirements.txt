@@ -19,6 +19,5 @@ httpx==0.28.1
 Pillow==12.2.0
 beautifulsoup4==4.14.3
 
-# livewatch: Twitch ad-free recording, YouTube live chat without an API key
+# livewatch: Twitch ad-free recording
 streamlink
-chat-downloader
